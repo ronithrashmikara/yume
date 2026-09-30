@@ -19,9 +19,9 @@
 // and a rate-limited provider is skipped until its limit resets — so the free
 // tiers of the two back each other up mid-session.
 
-type ProviderName = "cerebras" | "groq" | "groq-2" | "fal";
+export type ProviderName = "cerebras" | "groq" | "groq-2" | "fal";
 
-type Provider = {
+export type Provider = {
   name: ProviderName;
   url: string;
   key: string;
@@ -34,7 +34,8 @@ type Provider = {
   timeoutMs?: number;
 };
 
-function providers(): Provider[] {
+/** The providers configured in the environment, in the order they are tried. */
+export function providers(): Provider[] {
   const list: Provider[] = [];
   if (process.env.CEREBRAS_API_KEY) {
     list.push({
@@ -98,12 +99,44 @@ const TIMEOUT_MS = 8_000;
 
 /** The provider cannot serve us for a while: rate-limited, or a key it refuses. */
 class Unavailable extends Error {
-  constructor(
-    message: string,
-    readonly retryAfterMs: number,
-  ) {
+  readonly retryAfterMs: number;
+  constructor(message: string, retryAfterMs: number) {
     super(message);
+    this.retryAfterMs = retryAfterMs;
   }
+}
+
+/**
+ * How long to stop asking a provider after a failed response, or null when the
+ * failure is not about availability (a 5xx, a bad request) and the next call
+ * may try it again straight away.
+ */
+export function cooldownMs(status: number, retryAfterHeader: string | null, body: string): number | null {
+  if (status === 429) {
+    const retryAfter = Number(retryAfterHeader);
+    // A daily allowance spent is not coming back in seconds, whatever
+    // retry-after says; stop asking for a while.
+    const daily = /per day|TPD|RPD/.test(body);
+    return daily ? 15 * 60_000 : Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 10_000;
+  }
+  // A missing or revoked key will not fix itself mid-session; stop paying a
+  // round trip for it on every call.
+  if (status === 401 || status === 403) return 10 * 60_000;
+  return null;
+}
+
+/**
+ * Providers still cooling down go last rather than being dropped: if every
+ * provider is limited, the one that frees up soonest is still worth a try.
+ * Otherwise the configured order is kept (the sort is stable).
+ */
+export function orderByCooldown<P extends { name: ProviderName }>(
+  list: readonly P[],
+  cooling: ReadonlyMap<ProviderName, number>,
+  now: number,
+): P[] {
+  const wait = (p: P) => Math.max(0, (cooling.get(p.name) ?? 0) - now);
+  return [...list].sort((a, b) => wait(a) - wait(b));
 }
 
 /**
@@ -138,24 +171,15 @@ async function callProvider<T>(
     signal: AbortSignal.timeout(p.timeoutMs ?? TIMEOUT_MS),
   });
 
-  if (response.status === 429) {
-    const retryAfter = Number(response.headers.get("retry-after"));
-    const body = await response.text();
-    // A daily allowance spent is not coming back in seconds, whatever
-    // retry-after says; stop asking for a while.
-    const daily = /per day|TPD|RPD/.test(body);
-    throw new Unavailable(
-      `${p.name} rate-limited: ${body}`,
-      daily ? 15 * 60_000 : Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 10_000,
-    );
-  }
-  // A missing or revoked key will not fix itself mid-session; stop paying a
-  // round trip for it on every call.
-  if (response.status === 401 || response.status === 403) {
-    throw new Unavailable(`${p.name} refused the key (${response.status})`, 10 * 60_000);
-  }
   if (!response.ok) {
     const body = await response.text();
+    const cooldown = cooldownMs(response.status, response.headers.get("retry-after"), body);
+    if (cooldown !== null) {
+      throw new Unavailable(
+        response.status === 429 ? `${p.name} rate-limited: ${body}` : `${p.name} refused the key (${response.status})`,
+        cooldown,
+      );
+    }
     // Groq validates JSON mode itself and answers 400 when the model slips.
     if (body.includes("json_validate_failed")) throw new Malformed(`${p.name} generated invalid JSON`);
     throw new Error(`${p.name} returned ${response.status}: ${body}`);
@@ -186,12 +210,7 @@ export async function chatJson<T>({
   const all = providers();
   if (!all.length) throw new Error("No model provider is configured (CEREBRAS_API_KEY, GROQ_API_KEY or FAL_KEY)");
 
-  // Providers still cooling down go last rather than being dropped: if every
-  // provider is limited, the one that frees up soonest is still worth a try.
-  const now = Date.now();
-  const order = [...all].sort(
-    (a, b) => Math.max(0, (coolingUntil.get(a.name) ?? 0) - now) - Math.max(0, (coolingUntil.get(b.name) ?? 0) - now),
-  );
+  const order = orderByCooldown(all, coolingUntil, Date.now());
 
   let lastError: unknown;
   for (const p of order) {

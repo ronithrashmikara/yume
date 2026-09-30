@@ -6,7 +6,9 @@
     "dev": "node scripts/dev-with-session-cleanup.mjs",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --no-warnings --test \"tests/*.test.mjs\"",
+    "bench:grading": "node scripts/bench-grading.mjs"
   },
   "dependencies": {
     "@next/env": "^16.3.5",

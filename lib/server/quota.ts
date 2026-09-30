@@ -123,7 +123,7 @@ export function isJudgeCode(code: unknown): boolean {
 
 const REACTOR_API_URL = "https://api.reactor.inc";
 
-type ReactorSession = { created_at?: string; updated_at?: string; closed?: boolean; state?: string };
+export type ReactorSession = { created_at?: string; updated_at?: string; closed?: boolean; state?: string };
 
 let accountId: string | null = null;
 // Read at most every 20s; a dream minted in between is added straight away, so a
@@ -138,6 +138,37 @@ async function reactor(path: string) {
   });
   if (!res.ok) throw new Error(`Reactor ${path} returned ${res.status}`);
   return res.json();
+}
+
+/**
+ * Seconds of Orbis time the sessions started at or after `dayStart` account
+ * for: closed sessions by how long they ran, open ones as a full five minutes
+ * (they may yet run that long), each capped at five minutes. `older` says
+ * whether any session started before `dayStart`.
+ */
+export function billedSecondsSince(sessions: ReactorSession[], dayStart: number): { seconds: number; older: boolean } {
+  let seconds = 0;
+  let older = false;
+  for (const s of sessions) {
+    const start = Date.parse(s.created_at ?? "");
+    if (!Number.isFinite(start)) continue;
+    if (start < dayStart) {
+      older = true;
+      continue;
+    }
+    const closed = s.closed || s.state === "CLOSED";
+    const closedAt = closed ? Date.parse(s.updated_at ?? "") : NaN;
+    // Open, or closed without a readable end time: count the full five minutes,
+    // so one odd record cannot turn the day's total into NaN.
+    const end = Number.isFinite(closedAt) ? closedAt : start + SECONDS_PER_DREAM * 1000;
+    seconds += Math.min(SECONDS_PER_DREAM, Math.max(0, (end - start) / 1000));
+  }
+  return { seconds, older };
+}
+
+/** Whether one more dream fits under the cap: the daily budget, or the hard ceiling for a judge. */
+export function dreamFits(spentUsd: number, judge: boolean, quota: Pick<typeof QUOTA, "dailyBudgetUsd" | "hardCapUsd"> = QUOTA): boolean {
+  return spentUsd + DREAM_USD <= (judge ? quota.hardCapUsd : quota.dailyBudgetUsd);
 }
 
 /**
@@ -157,18 +188,9 @@ export async function spentToday(): Promise<number> {
       next_cursor?: string | null;
       has_more?: boolean;
     };
-    let older = false;
-    for (const s of data.sessions ?? []) {
-      const start = Date.parse(s.created_at ?? "");
-      if (!Number.isFinite(start)) continue;
-      if (start < dayStart) {
-        older = true;
-        continue;
-      }
-      const closed = s.closed || s.state === "CLOSED";
-      const end = closed ? Date.parse(s.updated_at ?? "") : start + SECONDS_PER_DREAM * 1000;
-      seconds += Math.min(SECONDS_PER_DREAM, Math.max(0, (end - start) / 1000));
-    }
+    const counted = billedSecondsSince(data.sessions ?? [], dayStart);
+    seconds += counted.seconds;
+    const older = counted.older;
     // Newest first: once a page reaches yesterday, the rest is older still.
     if (older || !data.has_more || !data.next_cursor) break;
     cursor = data.next_cursor;
@@ -188,7 +210,7 @@ export function noteDreamStarted() {
  */
 export async function budgetAllows(judge = false): Promise<boolean> {
   try {
-    return (await spentToday()) + DREAM_USD <= (judge ? QUOTA.hardCapUsd : QUOTA.dailyBudgetUsd);
+    return dreamFits(await spentToday(), judge);
   } catch (caught) {
     console.error("Could not read today's Orbis spend", caught);
     return true;
